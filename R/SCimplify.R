@@ -600,3 +600,147 @@ SCimplify_from_embedding <- function(X,
   return(res)
 }
 
+#' Detection of metacells with the SuperCell approach from precomputed kNN graph
+#'
+#' This function detects metacells from a precomputed kNN graph
+#'
+#'
+#' @param sc.nw precomputed kNN graph (igraph object) with cells as nodes
+#' @param cell.annotation a vector of cell type annotation, if provided, metacells that contain single cells of different cell type annotation will be split in multiple pure metacell (may result in slightly larger number of metacells than expected with a given gamma)
+#' @param cell.split.condition a vector of cell conditions that must not be mixed in one metacell. If provided, metacells will be split in condition-pure metacell (may result in significantly(!) larger number of metacells than expected)
+#' @param gamma graining level of data (proportion of number of single cells in the initial dataset to the number of metacells in the final dataset)
+#' @param seed seed to use (not used in this function but kept for compatibility)
+#' @param igraph.clustering clustering method to identify metacells (available methods "walktrap" (default) and "louvain" (not recommended, gamma is ignored)).
+#' @param return.singlecell.NW whether return single-cell network
+#' @param return.hierarchical.structure whether return hierarchical structure of metacell
+#' @param ... additional parameters (not used but kept for compatibility)
+#'
+#' @return a list with components
+#' \itemize{
+#'   \item graph.supercells - igraph object of a simplified network (number of nodes corresponds to number of metacells)
+#'   \item membership - assignment of each single cell to a particular metacell
+#'   \item graph.singlecells - igraph object (kNN network) of single-cell data
+#'   \item supercell_size - size of metacells (former super-cells)
+#'   \item gamma - requested graining level
+#'   \item N.SC - number of obtained metacells
+#'   \item genes.use - used genes (NA due to low-dim representation)
+#'   \item sc.cell.annotation. - single-cell cell type annotation (if provided)
+#'   \item sc.cell.split.condition. - single-cell split condition (if provided)
+#'   \item SC.cell.annotation. - super-cell cell type annotation (if was provided for single cells)
+#'   \item SC.cell.split.condition. - super-cell split condition (if was provided for single cells)
+#'
+#' }
+#'
+#' @export
+
+SCimplify_from_knn_graph <- function(sc.nw,
+                                     cell.annotation = NULL,
+                                     cell.split.condition = NULL,
+                                     gamma = 10,
+                                     seed = 12345,
+                                     igraph.clustering = c("walktrap", "louvain"),
+                                     return.singlecell.NW = TRUE,
+                                     return.hierarchical.structure = TRUE,
+                                     ...){
+
+  # Validate input
+  if(!inherits(sc.nw, "igraph")){
+    stop("sc.nw must be an igraph object (precomputed kNN graph)")
+  }
+
+  # Get number of cells from the graph
+  N.c <- igraph::vcount(sc.nw)
+
+  # Extract cell IDs from graph vertex names
+  cell.ids <- names(igraph::V(sc.nw))
+
+  if(is.null(cell.ids)){
+    cell.ids <- as.character(1:N.c)
+    warning("No vertex names found in sc.nw, using numeric IDs")
+  }
+
+  # Validate gamma
+  if(gamma > 100 & N.c < 100000){
+    warning(paste0("Graining level (gamma = ", gamma, ") seems to be very large! Please, consider using smaller gamma, the suggested range is 10-50."))
+  }
+
+  # Perform clustering on the precomputed graph
+  k <- round(N.c/gamma)
+
+  if(igraph.clustering[1] == "walktrap"){
+    g.s <- igraph::cluster_walktrap(sc.nw)
+    g.s$membership <- igraph::cut_at(g.s, k)
+
+  } else if(igraph.clustering[1] == "louvain") {
+    warning(paste("igraph.clustering =", igraph.clustering, ", gamma is ignored"))
+    g.s <- igraph::cluster_louvain(sc.nw)
+
+  } else {
+    stop(paste("Unknown clustering method (", igraph.clustering, "), please use louvain or walktrap"))
+  }
+
+  membership <- g.s$membership
+  names(membership) <- cell.ids
+
+  ## Split super-cells containing cells from different annotations or conditions
+  if(!is.null(cell.annotation) | !is.null(cell.split.condition)){
+    if(is.null(cell.annotation)) cell.annotation <- rep("a", N.c)
+    if(is.null(cell.split.condition)) cell.split.condition <- rep("s", N.c)
+    names(cell.annotation) <- names(cell.split.condition) <- cell.ids
+
+    split.cells <- interaction(cell.annotation[cell.ids], cell.split.condition[cell.ids], drop = TRUE)
+
+    membership.intr <- interaction(membership, split.cells, drop = TRUE)
+    membership <- as.numeric(membership.intr)
+
+    map.membership <- unique(membership)
+    names(map.membership) <- unique(as.vector(membership.intr))
+
+    names(membership) <- cell.ids
+  }
+
+  # Contract the graph to create metacell graph
+  SC.NW <- igraph::contract(sc.nw, membership)
+
+  # Calculate metacell sizes
+  supercell_size <- as.vector(table(membership))
+
+  # Set edge and vertex attributes
+  igraph::E(SC.NW)$width <- sqrt(igraph::E(SC.NW)$weight/10)
+
+  if(igraph::vcount(SC.NW) == length(supercell_size)){
+    igraph::V(SC.NW)$size <- supercell_size
+    igraph::V(SC.NW)$sizesqrt <- sqrt(igraph::V(SC.NW)$size)
+  } else {
+    igraph::V(SC.NW)$size <- as.vector(table(membership))
+    igraph::V(SC.NW)$sizesqrt <- sqrt(igraph::V(SC.NW)$size)
+    warning("Supercell graph vertex count does not match expected size")
+  }
+
+  # Build result list
+  res <- list(graph.supercells = SC.NW,
+              gamma = gamma,
+              N.SC = length(unique(membership)),
+              membership = membership,
+              supercell_size = supercell_size,
+              genes.use = NA,
+              simplification.algo = igraph.clustering[1],
+              sc.cell.annotation. = cell.annotation,
+              sc.cell.split.condition. = cell.split.condition
+  )
+
+  if(return.singlecell.NW){
+    res$graph.singlecell <- sc.nw
+  }
+
+  if(!is.null(cell.annotation) | !is.null(cell.split.condition)){
+    res$SC.cell.annotation. <- supercell_assign(cell.annotation, res$membership)
+    res$SC.cell.split.condition. <- supercell_assign(cell.split.condition, res$membership)
+  }
+
+  if(igraph.clustering[1] == "walktrap" & return.hierarchical.structure){
+    res$h_membership <- g.s
+  }
+
+  return(res)
+}
